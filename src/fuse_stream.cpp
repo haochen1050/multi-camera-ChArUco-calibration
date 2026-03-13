@@ -3,26 +3,23 @@
 //  Real-time multi-camera point cloud streaming into Camera 1's frame.
 //  Opens selected RealSense cameras, projects every depth frame into
 //  cam1 coordinates and renders the merged cloud live with Open3D.
+//  Also displays ZED left/right RGB as textured planes, and camera frustums.
 //
 //  No ZED SDK required.
 //
 //  Usage:
 //    fuse_stream [--config     <cameras.yaml>]
-//               [--transforms  <results/extrinsics/all_to_cam1.yaml>]
+//               [--transforms  <results/extrinsics/all_to_cam1_extra.yaml>]
 //               [--cameras     cam1,cam2,cam4,cam5]   default: all
 //               [--min_depth   <m>]  default 0.1
 //               [--max_depth   <m>]  default 4.0
 //               [--stride      <px>] default 4  (skip pixels; higher = faster)
 //               [--voxel       <m>]  default 0  (0 = no voxel downsampling)
-//
-//  Examples:
-//    fuse_stream --cameras cam1           # only cam1
-//    fuse_stream --cameras cam1,cam2      # cam1 + cam2 fused
-//    fuse_stream --cameras cam1,cam2,cam4 # three cameras
-//    fuse_stream --stride 8               # very lightweight preview
-//
-//  Per-camera colors:
-//    cam1 = red   cam2 = green   cam4 = yellow   cam5 = magenta
+//               [--no_zed]           skip ZED camera
+//               [--no_frustums]      skip camera frustum display
+//               [--zed_dev <N>]      ZED V4L2 device index (default from config)
+//               [--zed_scale <f>]    ZED texture scale (default 0.5)
+//               [--plane_depth <m>]  ZED image plane depth (default 0.5)
 // =============================================================================
 
 #include <iostream>
@@ -61,6 +58,8 @@ struct RsCam {
     Eigen::Vector3d color;                // per-camera display color
 };
 
+static int streamW = 0, streamH = 0, streamFps = 15;
+
 static std::unique_ptr<RsCam> openCam(const std::string& name,
                                        const std::string& serial,
                                        const Eigen::Vector3d& displayColor)
@@ -72,15 +71,36 @@ static std::unique_ptr<RsCam> openCam(const std::string& name,
     try {
         rs2::config cfg;
         cfg.enable_device(serial);
-        cfg.enable_stream(RS2_STREAM_DEPTH, 0, 0, RS2_FORMAT_Z16,  30);
-        cfg.enable_stream(RS2_STREAM_COLOR, 0, 0, RS2_FORMAT_RGB8, 30);
-
-        auto profile      = c->pipe.start(cfg);
-        c->depth_scale    = profile.get_device()
-                                   .first<rs2::depth_sensor>()
-                                   .get_depth_scale();
-        c->color_intr     = profile.get_stream(RS2_STREAM_COLOR)
-                                   .as<rs2::video_stream_profile>().get_intrinsics();
+        // Try requested resolution; fall back to auto if unsupported
+        bool started = false;
+        if (streamW > 0 && streamH > 0) {
+            try {
+                cfg.enable_stream(RS2_STREAM_DEPTH, streamW, streamH, RS2_FORMAT_Z16,  streamFps);
+                cfg.enable_stream(RS2_STREAM_COLOR, streamW, streamH, RS2_FORMAT_RGB8, streamFps);
+                auto profile = c->pipe.start(cfg);
+                c->depth_scale = profile.get_device()
+                                        .first<rs2::depth_sensor>()
+                                        .get_depth_scale();
+                c->color_intr  = profile.get_stream(RS2_STREAM_COLOR)
+                                        .as<rs2::video_stream_profile>().get_intrinsics();
+                started = true;
+            } catch (...) {
+                // Resolution not supported, fall back to auto
+                c->pipe = rs2::pipeline();
+                cfg = rs2::config();
+                cfg.enable_device(serial);
+            }
+        }
+        if (!started) {
+            cfg.enable_stream(RS2_STREAM_DEPTH, 0, 0, RS2_FORMAT_Z16,  30);
+            cfg.enable_stream(RS2_STREAM_COLOR, 0, 0, RS2_FORMAT_RGB8, 30);
+            auto profile = c->pipe.start(cfg);
+            c->depth_scale = profile.get_device()
+                                    .first<rs2::depth_sensor>()
+                                    .get_depth_scale();
+            c->color_intr  = profile.get_stream(RS2_STREAM_COLOR)
+                                    .as<rs2::video_stream_profile>().get_intrinsics();
+        }
 
         // Warm-up: discard early frames
         for (int i = 0; i < 10; ++i) c->pipe.wait_for_frames();
@@ -114,6 +134,215 @@ static bool loadT44(const std::string& path, const std::string& key,
     for (int r = 0; r < 4; ++r)
         for (int c = 0; c < 4; ++c)
             T[r][c] = m.at<double>(r, c);
+    return true;
+}
+
+// ── Transform a 3D point by a 4×4 matrix ─────────────────────────────────────
+
+static Eigen::Vector3d transformPt(const double T[4][4],
+                                   double x, double y, double z)
+{
+    return {T[0][0]*x + T[0][1]*y + T[0][2]*z + T[0][3],
+            T[1][0]*x + T[1][1]*y + T[1][2]*z + T[1][3],
+            T[2][0]*x + T[2][1]*y + T[2][2]*z + T[2][3]};
+}
+
+// ── Unproject image corner to 3D at given depth ──────────────────────────────
+
+static Eigen::Vector3d unprojectCorner(double u, double v,
+                                       double fx, double fy, double cx, double cy,
+                                       double depth,
+                                       const double T[4][4])
+{
+    double x = (u - cx) * depth / fx;
+    double y = (v - cy) * depth / fy;
+    return transformPt(T, x, y, depth);
+}
+
+// ── Create a textured quad mesh for a single camera image plane ──────────────
+
+static std::shared_ptr<o3d::geometry::TriangleMesh>
+createImagePlane(const double T[4][4],
+                 double fx, double fy, double cx, double cy,
+                 int imgW, int imgH, double planeDepth,
+                 double scale = 1.0)
+{
+    auto mesh = std::make_shared<o3d::geometry::TriangleMesh>();
+
+    auto tl = unprojectCorner(0,    0,    fx, fy, cx, cy, planeDepth, T);
+    auto tr = unprojectCorner(imgW, 0,    fx, fy, cx, cy, planeDepth, T);
+    auto br = unprojectCorner(imgW, imgH, fx, fy, cx, cy, planeDepth, T);
+    auto bl = unprojectCorner(0,    imgH, fx, fy, cx, cy, planeDepth, T);
+
+    // Shrink corners toward center while keeping same distance
+    if (scale != 1.0) {
+        Eigen::Vector3d center = (tl + tr + br + bl) / 4.0;
+        tl = center + scale * (tl - center);
+        tr = center + scale * (tr - center);
+        br = center + scale * (br - center);
+        bl = center + scale * (bl - center);
+    }
+
+    mesh->vertices_ = {tl, tr, br, bl};
+    mesh->triangles_ = {{0, 2, 1}, {0, 3, 2}};
+
+    mesh->triangle_uvs_ = {
+        {0.0, 0.0}, {1.0, 1.0}, {1.0, 0.0},  // tri 0: tl, br, tr
+        {0.0, 0.0}, {0.0, 1.0}, {1.0, 1.0},  // tri 1: tl, bl, br
+    };
+
+    auto img = std::make_shared<o3d::geometry::Image>();
+    img->Prepare(1, 1, 3, 1);
+    mesh->textures_.push_back(*img);
+    mesh->triangle_material_ids_ = {0, 0};
+
+    return mesh;
+}
+
+// ── Update the texture on an image plane mesh ─────────────────────────────────
+
+static void updateImagePlaneTexture(o3d::geometry::TriangleMesh& mesh,
+                                    const cv::Mat& rgb)
+{
+    auto& tex = mesh.textures_[0];
+    tex.Prepare(rgb.cols, rgb.rows, 3, 1);
+    memcpy(tex.data_.data(), rgb.data, rgb.cols * rgb.rows * 3);
+}
+
+// ── Create a camera frustum as a TriangleMesh (thick lines via cylinders) ─────
+
+static std::shared_ptr<o3d::geometry::TriangleMesh>
+createCameraFrustum(const double T[4][4],
+                    double fx, double fy, double cx, double cy,
+                    int imgW, int imgH, double depth,
+                    const Eigen::Vector3d& color,
+                    double radius = 0.002)
+{
+    auto origin = transformPt(T, 0, 0, 0);
+    auto tl = unprojectCorner(0,    0,    fx, fy, cx, cy, depth, T);
+    auto tr = unprojectCorner(imgW, 0,    fx, fy, cx, cy, depth, T);
+    auto br = unprojectCorner(imgW, imgH, fx, fy, cx, cy, depth, T);
+    auto bl = unprojectCorner(0,    imgH, fx, fy, cx, cy, depth, T);
+
+    std::vector<Eigen::Vector3d> pts = {origin, tl, tr, br, bl};
+    // 4 lines from origin to corners + 4 connecting corners
+    int edges[][2] = {{0,1},{0,2},{0,3},{0,4}, {1,2},{2,3},{3,4},{4,1}};
+
+    auto combined = std::make_shared<o3d::geometry::TriangleMesh>();
+    for (auto& e : edges) {
+        auto cyl = o3d::geometry::TriangleMesh::CreateCylinder(radius, (pts[e[1]] - pts[e[0]]).norm(), 6, 1);
+
+        // Orient cylinder from pts[e[0]] to pts[e[1]]
+        Eigen::Vector3d dir = (pts[e[1]] - pts[e[0]]).normalized();
+        Eigen::Vector3d up(0, 0, 1);  // cylinder default axis
+        Eigen::Vector3d mid = (pts[e[0]] + pts[e[1]]) * 0.5;
+
+        // Rotation from Z-axis to dir
+        Eigen::Vector3d axis = up.cross(dir);
+        double angle = std::acos(std::clamp(up.dot(dir), -1.0, 1.0));
+        Eigen::Matrix4d transform = Eigen::Matrix4d::Identity();
+        if (axis.norm() > 1e-6) {
+            axis.normalize();
+            Eigen::AngleAxisd rot(angle, axis);
+            transform.block<3,3>(0,0) = rot.toRotationMatrix();
+        } else if (up.dot(dir) < 0) {
+            // 180-degree flip
+            transform.block<3,3>(0,0) = Eigen::AngleAxisd(M_PI, Eigen::Vector3d(1,0,0)).toRotationMatrix();
+        }
+        transform.block<3,1>(0,3) = mid;
+        cyl->Transform(transform);
+        *combined += *cyl;
+    }
+
+    // Add a small sphere at the camera origin
+    auto sphere = o3d::geometry::TriangleMesh::CreateSphere(radius * 3, 8);
+    sphere->Translate(origin);
+    *combined += *sphere;
+
+    combined->PaintUniformColor(color);
+    combined->ComputeVertexNormals();
+
+    return combined;
+}
+
+// ── Create a 3D text label at a camera position ──────────────────────────────
+
+static std::shared_ptr<o3d::geometry::TriangleMesh>
+createCameraLabel(const double T[4][4], const std::string& text,
+                  const Eigen::Vector3d& color, double scale = 0.02)
+{
+    // Create text mesh using tensor API, then convert to legacy
+    auto tmesh = o3d::t::geometry::TriangleMesh::CreateText(text, 1.0);
+    auto legacy = tmesh.ToLegacy();
+
+    // Scale and position the text
+    // Text is created in XY plane; we need to transform it to the camera position
+    // First scale it down
+    Eigen::Matrix4d S = Eigen::Matrix4d::Identity();
+    S(0,0) = scale; S(1,1) = scale; S(2,2) = scale;
+
+    // Build the camera's 4x4 transform as Eigen matrix
+    Eigen::Matrix4d camT = Eigen::Matrix4d::Identity();
+    for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 4; ++c)
+            camT(r, c) = T[r][c];
+
+    // Place text slightly above the camera (offset in camera's local Y direction)
+    Eigen::Matrix4d offset = Eigen::Matrix4d::Identity();
+    offset(1, 3) = -1.5;  // shift up in local frame (before scaling)
+
+    legacy.Transform(camT * S * offset);
+
+    // Paint uniform color
+    legacy.PaintUniformColor(color);
+
+    return std::make_shared<o3d::geometry::TriangleMesh>(std::move(legacy));
+}
+
+// ── Convert T265 pose to 4×4 Eigen matrix ─────────────────────────────────────
+
+static Eigen::Matrix4d poseToMatrix(const rs2_pose& pose)
+{
+    Eigen::Quaterniond q(pose.rotation.w, pose.rotation.x,
+                         pose.rotation.y, pose.rotation.z);
+    Eigen::Matrix4d T = Eigen::Matrix4d::Identity();
+    T.block<3,3>(0,0) = q.toRotationMatrix();
+    T(0,3) = pose.translation.x;
+    T(1,3) = pose.translation.y;
+    T(2,3) = pose.translation.z;
+    return T;
+}
+
+// ── Apply 4×4 Eigen transform to a double[4][4] → result double[4][4] ────────
+
+static void multiplyT44(const Eigen::Matrix4d& A, const double B[4][4], double C[4][4])
+{
+    for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 4; ++c) {
+            C[r][c] = 0;
+            for (int k = 0; k < 4; ++k)
+                C[r][c] += A(r, k) * B[k][c];
+        }
+}
+
+// ── Load camera intrinsics (fx, fy, cx, cy) from YAML ────────────────────────
+
+struct CamIntrinsics { double fx, fy, cx, cy; int w, h; };
+
+static bool loadIntrinsics(const std::string& path, CamIntrinsics& ci)
+{
+    cv::FileStorage fss(path, cv::FileStorage::READ);
+    if (!fss.isOpened()) return false;
+    cv::Mat K;
+    fss["K"] >> K;
+    if (K.empty()) return false;
+    K.convertTo(K, CV_64F);
+    ci.fx = K.at<double>(0, 0);
+    ci.fy = K.at<double>(1, 1);
+    ci.cx = K.at<double>(0, 2);
+    ci.cy = K.at<double>(1, 2);
+    ci.w  = (int)fss["image_width"].real();
+    ci.h  = (int)fss["image_height"].real();
     return true;
 }
 
@@ -173,12 +402,32 @@ static void appendCam(RsCam& cam, float minDep, float maxDep, int stride,
 static void printHelp(const char* prog)
 {
     std::cout
-        << "Usage: " << prog
-        << " [--cameras cam1,cam2,cam4,cam5]\n"
-        << "       [--config <cameras.yaml>] [--transforms <all_to_cam1.yaml>]\n"
-        << "       [--min_depth <m>] [--max_depth <m>]\n"
-        << "       [--stride <px>]   (pixel step, default 4 — higher = faster)\n"
-        << "       [--voxel <m>]     (voxel size for downsampling, default 0 = off)\n";
+        << "Real-time multi-camera point cloud fusion viewer.\n\n"
+        << "Usage: " << prog << " [options]\n\n"
+        << "Cameras:\n"
+        << "  --cameras <list>      Comma-separated camera list (default: cam1,cam2,cam4,cam5)\n"
+        << "  --config <path>       Camera config YAML (default: configs/cameras.yaml)\n"
+        << "  --transforms <path>   Extrinsic transforms (default: results/extrinsics/all_to_cam1_extra.yaml)\n\n"
+        << "Depth:\n"
+        << "  --min_depth <m>       Minimum depth threshold (default: 0.25, L515 min)\n"
+        << "  --max_depth <m>       Maximum depth threshold (default: 4.0)\n"
+        << "  --stride <px>         Pixel step — higher = fewer points, faster (default: 4)\n"
+        << "  --voxel <m>           Voxel downsample size, 0 = off (default: 0)\n\n"
+        << "Stream:\n"
+        << "  --res <WxH>           Stream resolution, e.g. 640x480 (default: auto)\n"
+        << "  --fps <N>             Stream framerate (default: 15)\n\n"
+        << "ZED image plane:\n"
+        << "  --no_zed              Skip ZED camera RGB plane\n"
+        << "  --zed_dev <N>         ZED V4L2 device index (default: from config)\n"
+        << "  --zed_scale <f>       ZED texture resolution scale (default: 0.5)\n"
+        << "  --plane_depth <m>     Distance of image plane from ZED camera (default: 1.5)\n"
+        << "  --plane_scale <f>     Size scale of image plane, 1.0 = full (default: 0.42)\n\n"
+        << "Display:\n"
+        << "  --no_frustums         Hide camera frustum wireframes\n"
+        << "  --t265                Enable T265 tracking (coordinate axes + trajectory trace)\n\n"
+        << "Controls:\n"
+        << "  Left drag   — rotate       Right drag/scroll — zoom\n"
+        << "  Ctrl+drag   — pan          Q / close window  — stop\n";
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -186,23 +435,46 @@ static void printHelp(const char* prog)
 int main(int argc, char** argv)
 {
     std::string configPath     = "configs/cameras.yaml";
-    std::string transformsPath = "results/extrinsics/all_to_cam1.yaml";
+    std::string transformsPath = "results/extrinsics/all_to_cam1_extra.yaml";
     std::string camerasArg     = "cam1,cam2,cam4,cam5";   // default: all
-    float minDep  = 0.1f;
+    float minDep  = 0.25f;
     float maxDep  = 4.0f;
     int   stride  = 4;      // default 4 — lighter workload
     double voxel  = 0.0;
+    bool  noZed   = false;
+    bool  noFrustums = false;
+    bool  useT265 = false;
+    int   zedDevOverride = -1;
+    double zedScale = 0.5;
+    double planeDepth = 1.5;
+    double planeScale = 0.42;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--help" || a == "-h") { printHelp(argv[0]); return 0; }
-        else if (a == "--config"     && i+1 < argc) configPath     = argv[++i];
-        else if (a == "--transforms" && i+1 < argc) transformsPath = argv[++i];
-        else if (a == "--cameras"    && i+1 < argc) camerasArg     = argv[++i];
-        else if (a == "--min_depth"  && i+1 < argc) minDep         = std::stof(argv[++i]);
-        else if (a == "--max_depth"  && i+1 < argc) maxDep         = std::stof(argv[++i]);
-        else if (a == "--stride"     && i+1 < argc) stride         = std::stoi(argv[++i]);
-        else if (a == "--voxel"      && i+1 < argc) voxel          = std::stod(argv[++i]);
+        else if (a == "--config"      && i+1 < argc) configPath     = argv[++i];
+        else if (a == "--transforms"  && i+1 < argc) transformsPath = argv[++i];
+        else if (a == "--cameras"     && i+1 < argc) camerasArg     = argv[++i];
+        else if (a == "--min_depth"   && i+1 < argc) minDep         = std::stof(argv[++i]);
+        else if (a == "--max_depth"   && i+1 < argc) maxDep         = std::stof(argv[++i]);
+        else if (a == "--stride"      && i+1 < argc) stride         = std::stoi(argv[++i]);
+        else if (a == "--voxel"       && i+1 < argc) voxel          = std::stod(argv[++i]);
+        else if (a == "--fps"         && i+1 < argc) streamFps      = std::stoi(argv[++i]);
+        else if (a == "--zed_dev"     && i+1 < argc) zedDevOverride = std::stoi(argv[++i]);
+        else if (a == "--zed_scale"   && i+1 < argc) zedScale       = std::stod(argv[++i]);
+        else if (a == "--plane_depth" && i+1 < argc) planeDepth     = std::stod(argv[++i]);
+        else if (a == "--plane_scale" && i+1 < argc) planeScale     = std::stod(argv[++i]);
+        else if (a == "--no_zed")       noZed = true;
+        else if (a == "--no_frustums")  noFrustums = true;
+        else if (a == "--t265")         useT265 = true;
+        else if (a == "--res"         && i+1 < argc) {
+            std::string r = argv[++i];
+            auto x = r.find('x');
+            if (x != std::string::npos) {
+                streamW = std::stoi(r.substr(0, x));
+                streamH = std::stoi(r.substr(x+1));
+            }
+        }
     }
 
     // Parse comma-separated camera list
@@ -221,20 +493,24 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    // Load transforms
-    double T_1_1[4][4], T_1_2[4][4], T_1_4[4][4], T_1_5[4][4];
-    if (!loadT44(transformsPath, "T_1_1", T_1_1) ||
-        !loadT44(transformsPath, "T_1_2", T_1_2) ||
-        !loadT44(transformsPath, "T_1_4", T_1_4) ||
-        !loadT44(transformsPath, "T_1_5", T_1_5)) {
+    // Load transforms (all 6 cameras from all_to_cam1_extra.yaml)
+    double T_1_1[4][4], T_1_2[4][4], T_1_3L[4][4], T_1_4[4][4], T_1_5[4][4], T_1_3R[4][4];
+    if (!loadT44(transformsPath, "T_1_cam1", T_1_1) ||
+        !loadT44(transformsPath, "T_1_cam2", T_1_2) ||
+        !loadT44(transformsPath, "T_1_cam3_left", T_1_3L) ||
+        !loadT44(transformsPath, "T_1_cam4", T_1_4) ||
+        !loadT44(transformsPath, "T_1_cam5", T_1_5) ||
+        !loadT44(transformsPath, "T_1_cam3_right", T_1_3R)) {
         return 1;
     }
 
     // Per-camera display colors (RGB 0-1)
-    const Eigen::Vector3d kRed     = {1.0, 0.2, 0.2};
-    const Eigen::Vector3d kGreen   = {0.2, 1.0, 0.2};
-    const Eigen::Vector3d kYellow  = {1.0, 1.0, 0.2};
-    const Eigen::Vector3d kMagenta = {1.0, 0.2, 1.0};
+    const Eigen::Vector3d kRed     = {1.0, 0.2, 0.2};   // cam1
+    const Eigen::Vector3d kGreen   = {0.2, 1.0, 0.2};   // cam2
+    const Eigen::Vector3d kCyan    = {0.2, 1.0, 1.0};   // cam3_left
+    const Eigen::Vector3d kBlue    = {0.2, 0.2, 1.0};   // cam3_right
+    const Eigen::Vector3d kYellow  = {1.0, 1.0, 0.2};   // cam4
+    const Eigen::Vector3d kMagenta = {1.0, 0.2, 1.0};   // cam5
 
     // Enumerate connected RealSense devices once (avoids interfering contexts later)
     std::set<std::string> connected;
@@ -311,6 +587,109 @@ int main(int argc, char** argv)
               << "  voxel=" << (voxel > 0 ? std::to_string(voxel) + "m" : "off")
               << "\n";
 
+    // ── Load intrinsics for all 6 cameras (for frustums + labels) ──────────────
+
+    struct FrustumInfo {
+        CamIntrinsics intr;
+        double T[4][4];
+        Eigen::Vector3d color;
+        std::string name;
+        std::string label;  // model name for 3D text
+    };
+    std::vector<FrustumInfo> frustumInfos;
+    {
+        // path, T ptr, color, short name, label
+        struct E { std::string p; double(*T)[4]; Eigen::Vector3d c; std::string n; std::string l; };
+        std::vector<E> entries = {
+            {"results/intrinsics/cam1.yaml",       T_1_1,  kRed,     "cam1", "L515-1"},
+            {"results/intrinsics/cam2.yaml",       T_1_2,  kGreen,   "cam2", "L515-2"},
+            {"results/intrinsics/cam3_left.yaml",  T_1_3L, kCyan,    "cam3L", "ZED-L"},
+            {"results/intrinsics/cam3_right.yaml", T_1_3R, kBlue,    "cam3R", "ZED-R"},
+            {"results/intrinsics/cam4.yaml",       T_1_4,  kYellow,  "cam4", "D405-4"},
+            {"results/intrinsics/cam5.yaml",       T_1_5,  kMagenta, "cam5", "D405-5"},
+        };
+        for (auto& e : entries) {
+            FrustumInfo fi;
+            if (loadIntrinsics(e.p, fi.intr)) {
+                memcpy(fi.T, e.T, sizeof(double[4][4]));
+                fi.color = e.c;
+                fi.name = e.n;
+                fi.label = e.l;
+                frustumInfos.push_back(fi);
+            } else {
+                std::cerr << "[WARN] Cannot load intrinsics: " << e.p << "\n";
+            }
+        }
+    }
+
+    // ── Create camera frustum wireframes + labels ─────────────────────────────
+
+    std::vector<std::shared_ptr<o3d::geometry::TriangleMesh>> frustums;
+    if (!noFrustums) {
+        constexpr double kFrustumDepth = 0.06;
+        for (auto& fi : frustumInfos) {
+            auto mesh = createCameraFrustum(fi.T,
+                fi.intr.fx, fi.intr.fy, fi.intr.cx, fi.intr.cy,
+                fi.intr.w, fi.intr.h, kFrustumDepth, fi.color, 0.0015);
+            frustums.push_back(mesh);
+            std::cout << "[INFO] Frustum: " << fi.name << " (" << fi.label << ")\n";
+        }
+    }
+
+    // ── Open ZED camera via V4L2 ─────────────────────────────────────────────
+
+    cv::VideoCapture zedCap;
+    std::shared_ptr<o3d::geometry::TriangleMesh> zedMesh;
+
+    if (!noZed) {
+        int zedDev = zedDevOverride >= 0 ? zedDevOverride :
+                     (configs.count("cam3") ? configs.at("cam3").dev : -1);
+        if (zedDev >= 0) {
+            std::cout << "[INFO] Opening ZED on /dev/video" << zedDev << "..." << std::flush;
+            zedCap.open(zedDev, cv::CAP_V4L2);
+            if (zedCap.isOpened()) {
+                zedCap.set(cv::CAP_PROP_FRAME_WIDTH, 2560);
+                zedCap.set(cv::CAP_PROP_FRAME_HEIGHT, 720);
+                // Warm-up
+                cv::Mat tmp;
+                for (int i = 0; i < 5; ++i) zedCap.read(tmp);
+                std::cout << " ok\n";
+
+                // Single plane showing left camera image
+                CamIntrinsics ciL;
+                loadIntrinsics("results/intrinsics/cam3_left.yaml", ciL);
+
+                zedMesh = createImagePlane(T_1_3L,
+                    ciL.fx, ciL.fy, ciL.cx, ciL.cy,
+                    ciL.w, ciL.h, planeDepth, planeScale);
+            } else {
+                std::cerr << " FAILED\n";
+            }
+        } else {
+            std::cout << "[INFO] No ZED device configured, skipping.\n";
+        }
+    }
+
+    // ── Open T265 for rig pose tracking ─────────────────────────────────────
+
+    rs2::pipeline t265pipe;
+    bool t265active = false;
+
+    if (useT265) {
+        std::cout << "[INFO] Starting T265 (firmware load may take a few seconds)..." << std::flush;
+        try {
+            rs2::config t265cfg;
+            t265cfg.enable_device("905312111793");
+            t265cfg.enable_stream(RS2_STREAM_POSE, RS2_FORMAT_6DOF);
+            t265pipe.start(t265cfg);
+            for (int i = 0; i < 60; ++i) t265pipe.wait_for_frames(1000);
+            t265active = true;
+            std::cout << " ok\n";
+        } catch (const std::exception& e) {
+            std::cerr << " FAILED: " << e.what() << "\n";
+        }
+    }
+
     // ── Open3D visualizer setup ───────────────────────────────────────────────
 
     auto cloud = std::make_shared<o3d::geometry::PointCloud>();
@@ -321,6 +700,23 @@ int main(int argc, char** argv)
     vis.AddGeometry(cloud);
     vis.AddGeometry(frame);
 
+    // Add frustums
+    for (auto& f : frustums) vis.AddGeometry(f);
+
+    // Add ZED stereo image plane
+    if (zedMesh) vis.AddGeometry(zedMesh);
+
+    // T265 trajectory trace + moving axes
+    auto t265trace = std::make_shared<o3d::geometry::LineSet>();
+    auto t265axes  = std::make_shared<o3d::geometry::TriangleMesh>();
+    bool t265trace_added = false;
+    if (t265active) {
+        // Create initial small coordinate frame for T265 pose
+        *t265axes = *o3d::geometry::TriangleMesh::CreateCoordinateFrame(0.05);
+        vis.AddGeometry(t265axes);
+        // Don't add trace yet — wait until it has at least one segment
+    }
+
     // Set a reasonable initial viewpoint (look from +Z toward origin)
     auto& vc = vis.GetViewControl();
     vc.SetZoom(0.6);
@@ -329,7 +725,68 @@ int main(int argc, char** argv)
 
     int frameIdx = 0;
     bool viewReset = false;
+    Eigen::Matrix4d t265_prev_pose = Eigen::Matrix4d::Identity();
+
+    // Store initial ZED plane vertices for T265-driven rotation
+    auto t265_axes_base = o3d::geometry::TriangleMesh::CreateCoordinateFrame(0.05);
+    Eigen::Vector3d t265_last_trace_pt(0, 0, 0);
+    bool t265_has_trace = false;
+
     while (vis.PollEvents()) {
+        // ── Update T265 pose visualization ───────────────────────────────
+        if (t265active) {
+            rs2::frameset t265frames;
+            try {
+                t265frames = t265pipe.wait_for_frames(10);
+                auto pf = t265frames.first_or_default(RS2_STREAM_POSE);
+                if (pf) {
+                    auto pose = pf.as<rs2::pose_frame>().get_pose_data();
+                    Eigen::Matrix4d T = poseToMatrix(pose);
+
+                    // Update moving coordinate frame
+                    *t265axes = *t265_axes_base;
+                    t265axes->Transform(T);
+                    vis.UpdateGeometry(t265axes);
+
+                    // Add to trajectory trace (every few cm to avoid clutter)
+                    Eigen::Vector3d pos(T(0,3), T(1,3), T(2,3));
+                    if (!t265_has_trace || (pos - t265_last_trace_pt).norm() > 0.005) {
+                        if (t265_has_trace) {
+                            size_t n = t265trace->points_.size();
+                            t265trace->points_.push_back(pos);
+                            t265trace->lines_.push_back({(int)n - 1, (int)n});
+                            // Color by confidence: green=high, yellow=medium, red=low
+                            double g = std::min(1.0, pose.tracker_confidence / 3.0);
+                            t265trace->colors_.push_back({1.0 - g, g, 0.2});
+                        } else {
+                            t265trace->points_.push_back(pos);
+                        }
+                        t265_last_trace_pt = pos;
+                        t265_has_trace = true;
+                        if (!t265trace_added && !t265trace->lines_.empty()) {
+                            vis.AddGeometry(t265trace);
+                            t265trace_added = true;
+                        } else if (t265trace_added) {
+                            vis.UpdateGeometry(t265trace);
+                        }
+                    }
+
+                    // T265 shown as independent axes + trace only
+
+                    // Print pose info periodically
+                    if (frameIdx % 90 == 0) {
+                        auto rv = Eigen::AngleAxisd(T.block<3,3>(0,0));
+                        std::cout << "\r  T265: t=[" << std::fixed << std::setprecision(3)
+                                  << pos.x() << "," << pos.y() << "," << pos.z()
+                                  << "] rot=" << std::setprecision(1)
+                                  << rv.angle() * 180.0 / M_PI << "deg"
+                                  << " conf=" << pose.tracker_confidence
+                                  << "          " << std::flush;
+                    }
+                }
+            } catch (...) {}
+        }
+
         std::vector<Eigen::Vector3d> pts, cols;
         pts.reserve(4 * (640 / stride) * (480 / stride));
         cols.reserve(pts.capacity());
@@ -350,6 +807,23 @@ int main(int argc, char** argv)
 
         vis.UpdateGeometry(cloud);
 
+        // Update ZED left camera image plane
+        if (zedCap.isOpened() && zedMesh) {
+            cv::Mat sbs;
+            if (zedCap.read(sbs) && sbs.cols >= 2560 && sbs.rows >= 720) {
+                // Extract left half, convert BGR → RGB
+                cv::Mat leftBGR = sbs(cv::Rect(0, 0, 1280, 720));
+                cv::Mat leftRGB;
+                cv::cvtColor(leftBGR, leftRGB, cv::COLOR_BGR2RGB);
+
+                if (zedScale < 1.0)
+                    cv::resize(leftRGB, leftRGB, cv::Size(), zedScale, zedScale);
+
+                updateImagePlaneTexture(*zedMesh, leftRGB);
+                vis.UpdateGeometry(zedMesh);
+            }
+        }
+
         // Reset viewpoint once after the first real frame so the camera
         // fits to the actual point cloud (not the initial empty bounding box)
         if (!viewReset && !cloud->points_.empty()) {
@@ -367,6 +841,9 @@ int main(int argc, char** argv)
     std::cout << "\n[INFO] Window closed — stopping cameras.\n";
     vis.DestroyVisualizerWindow();
 
+    if (t265active) t265pipe.stop();
+    if (zedCap.isOpened()) zedCap.release();
+    zedMesh.reset();
     if (cam1) cam1->pipe.stop();
     if (cam2) cam2->pipe.stop();
     if (cam4) cam4->pipe.stop();

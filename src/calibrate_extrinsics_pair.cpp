@@ -183,7 +183,12 @@ int main(int argc, char** argv)
 
     std::cout << "  Stereo RMS: " << rms << " px\n";
 
-    cv::Mat T44 = makeT44(R, T);
+    // stereoCalibrate gives R,T mapping camA→camB (p_B = R*p_A + T).
+    // Our convention: T_a_b maps FROM b INTO a (p_a = T_a_b * p_b).
+    // So T_a_b = inv([R T; 0 1]).
+    cv::Mat T44_raw = makeT44(R, T);
+    cv::Mat T44;
+    cv::invert(T44_raw, T44);
     printTransform("T_" + name + ":", T44);
 
     fs::create_directories(outDir);

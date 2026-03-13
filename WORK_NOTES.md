@@ -12,8 +12,10 @@ single point cloud in Camera 1's coordinate frame. The array consists of:
 | cam3   | ZED-M (left)   | —         | N/A (V4L2)     |
 | cam4   | Intel D405     | —         | 130322271201   |
 | cam5   | Intel D405     | —         | 218622270381   |
+| t265   | Intel T265     | Tracking  | 905312111793   |
 
 Camera 1 is the reference frame. All other cameras are expressed relative to it.
+The T265 provides 6DOF pose tracking but is not extrinsically calibrated to the array.
 
 ---
 
@@ -35,6 +37,9 @@ Camera 1 is the reference frame. All other cameras are expressed relative to it.
 ```
 multi_cam_calib/
 ├── CMakeLists.txt
+├── calibrate_filtered.py               # Python stereo calib with iterative outlier removal
+├── calibrate_relay.py                  # relay calibration (independent solvePnP per camera)
+├── optimize_poses.py                   # pose graph optimization over all edges
 ├── configs/
 │   └── cameras.yaml                    # camera models, serials, V4L2 device index
 ├── include/
@@ -53,14 +58,17 @@ multi_cam_calib/
 │   ├── pair_2_3/cam2/  pair_2_3/cam3/
 │   ├── pair_3_4/cam3/  pair_3_4/cam4/
 │   ├── pair_4_5/cam4/  pair_4_5/cam5/
+│   ├── pair_5_zed_right/cam5/  pair_5_zed_right/zed_right/
+│   ├── pair_zed_right_1/zed_right/  pair_zed_right_1/cam1/
 │   └── zed_stereo/zed_left/ zed_stereo/zed_right/
 ├── results/
 │   ├── intrinsics/
 │   │   ├── cam1.yaml   cam2.yaml   cam3.yaml   cam4.yaml   cam5.yaml
 │   └── extrinsics/
 │       ├── cam1_cam2.yaml   cam2_cam3.yaml   cam3_cam4.yaml   cam4_cam5.yaml
-│       ├── zed_left_right.yaml
-│       └── all_to_cam1.yaml
+│       ├── cam5_zed_right.yaml   zed_right_cam1.yaml
+│       ├── all_to_cam1.yaml        # optimized poses (cam1-cam5)
+│       └── all_to_cam1_extra.yaml   # includes cam3_right
 └── build/                              # all compiled binaries
 ```
 
@@ -153,144 +161,164 @@ of sub-pixel. Always match the resolution used during `capture_pair`.
 
 #### Calibrated intrinsics results
 
-| Camera | fx     | fy     | cx    | cy    | Resolution |
-|--------|--------|--------|-------|-------|------------|
-| cam1   | 906.01 | 906.16 | 645.1 | 372.0 | 1280×720   |
-| cam2   | 912.05 | 912.57 | 641.3 | 355.8 | 1280×720   |
+| Camera | fx     | fy     | cx    | cy    | Resolution | Source |
+|--------|--------|--------|-------|-------|------------|--------|
+| cam1   | 906.01 | 906.16 | 645.1 | 372.0 | 1280×720   | RS SDK |
+| cam2   | 912.05 | 912.57 | 641.3 | 355.8 | 1280×720   | RS SDK |
+| cam4   | 651.70 | 651.70 | 323.5 | 238.5 | 640×480    | OpenCV calibrateCamera (SDK K as initial guess) |
+| cam5   | 645.60 | 645.60 | 323.5 | 238.5 | 640×480    | OpenCV calibrateCamera (SDK K as initial guess) |
+
+**D405 intrinsic calibration note:** D405 cameras report `distortion.inverse_brown_conrady`
+model, which is NOT compatible with OpenCV's standard Brown-Conrady model. Passing SDK
+distortion coefficients directly causes 155px+ stereo RMS. The fix is to re-calibrate
+intrinsics with `cv2.calibrateCamera` using `CALIB_USE_INTRINSIC_GUESS` with the SDK K
+matrix as initial guess. This produces OpenCV-compatible distortion coefficients (~4px RMS).
 
 ### ZED camera (cam3)
 
-ZED intrinsics are calibrated from captured images using `calibrate_intrinsics`:
+ZED intrinsics are loaded from the **factory calibration file** (`SN17307267.conf`) rather
+than re-calibrated. The factory file provides per-resolution intrinsics for left and right
+lenses.
 
-```bash
-./build/calibrate_intrinsics \
-    --images data/zed_stereo/zed_left \
-    --camera zed_left
+```
+results/intrinsics/cam3_left.yaml   — fx=697.8, fy=697.8, cx=661.9, cy=362.8 (1280×720)
+results/intrinsics/cam3_right.yaml  — fx=700.3, fy=700.3, cx=672.8, cy=358.7 (1280×720)
 ```
 
-Uses `cv::calibrateCamera` with all ChArUco frames. Requires ≥10 accepted frames.
-Output: `results/intrinsics/zed_left.yaml` (or `cam3.yaml`).
-
-**Known issue — ZED calibration divergence:** The ZED-M has a wide-angle lens (~87° HFOV).
-`cv::calibrateCamera` with standard distortion model consistently converges to a wrong
-local minimum (very large fx + large k1 that cancel each other), yielding RMS ~100px.
-Switching to `cv::fisheye::calibrate` crashes with a `norm_u1 > 0` assertion.
-
-**Current workaround:** `results/intrinsics/cam3.yaml` is a placeholder with estimated
-values: `fx = fy = 674`, `cx = 640`, `cy = 360`, zero distortion. This means cam3-related
-extrinsics are approximate.
-
-**Pending fix:** Two-phase calibration — fix focal length first, then release; or use a
-proper fisheye model with correct object-point format (CV_32FC3 shape Nx1x3 in C++).
+**Known issue — ZED calibration divergence:** `cv::calibrateCamera` with standard distortion
+model converges to a wrong local minimum. `cv::fisheye::calibrate` crashes with
+`norm_u1 > 0` assertion. Factory calibration is the practical workaround.
 
 ---
 
-## Step 4 — Pairwise Extrinsic Calibration (`calibrate_extrinsics_pair`)
+## Step 4 — Pairwise Extrinsic Calibration
 
-Computes the 4×4 rigid transform T_a_b (points in b → frame of a) between each adjacent
-pair using `cv::stereoCalibrate` with `CALIB_FIX_INTRINSIC`.
+Two tools are available for pairwise extrinsics:
+
+### C++ tool: `calibrate_extrinsics_pair`
+
+The original C++ tool. Uses `cv::stereoCalibrate` with `CALIB_FIX_INTRINSIC`.
 
 ```bash
 ./build/calibrate_extrinsics_pair \
     --images_a data/pair_1_2/cam1 --intr_a results/intrinsics/cam1.yaml \
     --images_b data/pair_1_2/cam2 --intr_b results/intrinsics/cam2.yaml \
     --name cam1_cam2
-
-./build/calibrate_extrinsics_pair \
-    --images_a data/pair_2_3/cam2 --intr_a results/intrinsics/cam2.yaml \
-    --images_b data/pair_2_3/cam3 --intr_b results/intrinsics/cam3.yaml \
-    --name cam2_cam3
-
-./build/calibrate_extrinsics_pair \
-    --images_a data/pair_3_4/cam3 --intr_a results/intrinsics/cam3.yaml \
-    --images_b data/pair_3_4/cam4 --intr_b results/intrinsics/cam4.yaml \
-    --name cam3_cam4
-
-./build/calibrate_extrinsics_pair \
-    --images_a data/pair_4_5/cam4 --intr_a results/intrinsics/cam4.yaml \
-    --images_b data/pair_4_5/cam5 --intr_b results/intrinsics/cam5.yaml \
-    --name cam4_cam5
 ```
 
-**Algorithm:**
-1. Detect ChArUco corners in every image of both directories
-2. Match frames by filename index; find common corner IDs per frame pair
-3. Run `cv::stereoCalibrate` with fixed intrinsics
-4. Save T_a_b (4×4), R (3×3), T (3×1), E, F, RMS to YAML
+### Python tool: `calibrate_filtered.py` (recommended)
+
+Python script with **iterative outlier removal**: runs stereoCalibrate, computes per-frame
+reprojection error, removes frames above threshold, repeats up to 5 iterations. Produces
+much cleaner results than single-pass calibration.
+
+```bash
+python3 calibrate_filtered.py cam1 cam2
+python3 calibrate_filtered.py cam2 cam3
+python3 calibrate_filtered.py cam3 cam4
+python3 calibrate_filtered.py cam4 cam5
+python3 calibrate_filtered.py cam5 zed_right
+python3 calibrate_filtered.py zed_right cam1
+
+# Options:
+#   --threshold 15    # per-frame RMS outlier threshold (default: 15px)
+#   --min_common 15   # minimum common charuco corners per frame (default: 15)
+```
+
+Camera name mapping: `cam3` → uses `cam3_left` intrinsics; `zed_right` → uses `cam3_right`.
 
 **Transform convention:** `T_a_b` maps a point from camera B into camera A's frame:
 ```
 p_camA = T_a_b * p_camB
 ```
 
-#### Pairwise extrinsics results
+**Critical bug fixed:** `cv::stereoCalibrate` returns R,T mapping camA→camB (i.e. T_b_from_a).
+The pipeline expects T_a_b (from B into A), so the result must be **inverted** before saving.
+Both the C++ and Python tools now apply `np.linalg.inv(T44)` / `cv::invert(T44)`.
 
-| Pair        | RMS (px) | Translation (m)              | Notes                        |
-|-------------|----------|------------------------------|------------------------------|
-| cam1_cam2   | 42.0     | [-0.016, -0.003, +0.023]     | L515 pair, reasonable        |
-| cam2_cam3   | 41.8     | [-0.040, -0.027, +0.078]     | Affected by cam3 placeholder K |
-| cam3_cam4   | 53.3     | [-0.018, -0.126, +0.195]     | Affected by cam3 placeholder K |
-| cam4_cam5   | 101.3    | [+0.762, +0.350, +1.988]     | **Suspicious** — needs recapture |
+### Loop closure topology
 
-The 42px RMS on cam1_cam2 is higher than ideal (<1px expected). Root cause:
-intrinsics were initially dumped at 1920×1080 instead of 1280×720. After re-dumping
-at the correct resolution the error remains ~42px, suggesting sub-optimal image capture
-(insufficient board pose diversity or too few frames).
+Instead of a simple chain (cam1→cam2→cam3→cam4→cam5), a **loop closure** approach is used.
+Six pairwise calibrations form a loop through the ZED stereo pair:
 
-The 101px RMS on cam4_cam5 with ~2m translation is unrealistic for adjacent cameras.
-This pair should be recaptured.
+```
+cam1 ─── cam2 ─── cam3_left ─── cam4 ─── cam5 ─── cam3_right ─── cam1
+                        └──── ZED factory baseline ────┘
+```
+
+Additional captured pairs:
+- `pair_5_zed_right/` — cam5 ↔ ZED right
+- `pair_zed_right_1/` — ZED right ↔ cam1
+
+#### Current pairwise extrinsics results
+
+| Pair              | Frames | RMS (px) | Translation (m)              |
+|-------------------|--------|----------|------------------------------|
+| cam1_cam2         | 27     | 6.58     | [-0.049, +0.000, -0.004]     |
+| cam2_cam3         | 21     | 8.32     | [+0.005, -0.033, +0.013]     |
+| cam3_cam4         | 15     | 14.18    | [-0.120, +0.022, +0.056]     |
+| cam4_cam5         | 22     | 14.45    | [-0.029, -0.003, +0.023]     |
+| cam5_zed_right    | —      | 16.50    | —                            |
+| zed_right_cam1    | —      | 19.98    | —                            |
 
 ---
 
-## Step 5 — Transform Chaining (`chain_transforms`)
+## Step 5 — Pose Graph Optimization (`optimize_poses.py`)
 
-Chains the four pairwise transforms into a single file expressing every camera relative
-to cam1.
+Replaces simple transform chaining with a **pose graph optimizer** that uses all pairwise
+calibrations (including loop closure edges) to find globally consistent transforms.
 
 ```bash
-./build/chain_transforms
+python3 optimize_poses.py
 # Output: results/extrinsics/all_to_cam1.yaml
+#         results/extrinsics/all_to_cam1_extra.yaml (includes cam3_right)
 ```
 
-**Chain formula:**
-```
-T_1_1 = Identity
-T_1_2 = T_cam1_cam2  (direct)
-T_1_3 = T_1_2 * T_cam2_cam3
-T_1_4 = T_1_3 * T_cam3_cam4
-T_1_5 = T_1_4 * T_cam4_cam5
-```
+**How it works:**
+- 6 camera nodes: cam1(ref), cam2, cam3_left, cam4, cam5, cam3_right
+- 7 edges: 6 pairwise calibrations + ZED factory stereo baseline (weight=5.0)
+- cam1 fixed at identity; other 5 cameras have 6 DOF each (30 parameters total)
+- Residuals: per-edge rotation error (rotvec) + translation error, weighted by 1/RMS
+- Solver: `scipy.optimize.least_squares` with Levenberg-Marquardt
+- Initial guess: chain traversal through edges
 
-#### Chained transform translations from cam1 origin
+**ZED factory stereo constraint:** loaded from `SN17307267.conf` — baseline=62.9mm,
+with small factory-calibrated rotation. Given weight=5.0 (high confidence).
 
-| Transform | tx (m)  | ty (m)  | tz (m)  |
-|-----------|---------|---------|---------|
-| T_1_1     |  0.000  |  0.000  |  0.000  |
-| T_1_2     | -0.016  | -0.003  | +0.023  |
-| T_1_3     | -0.047  | -0.026  | +0.106  |
-| T_1_4     | -0.050  | -0.164  | +0.294  |
-| T_1_5     | +1.529  | -1.069  | +1.452  |
+#### Current optimized poses (T_1_X)
 
-T_1_5 is unreliable due to the bad cam4_cam5 calibration.
+| Camera     | tx (m)  | ty (m)  | tz (m)  |
+|------------|---------|---------|---------|
+| cam1       | +0.000  | +0.000  | +0.000  |
+| cam2       | -0.037  | +0.004  | -0.002  |
+| cam3_left  | -0.021  | +0.042  | -0.015  |
+| cam4       | +0.112  | +0.054  | +0.006  |
+| cam5       | +0.078  | +0.082  | +0.013  |
+| cam3_right | -0.084  | +0.041  | -0.016  |
+
+#### Per-edge residuals after optimization
+
+| Edge                  | Rot err | Trans err |
+|-----------------------|---------|-----------|
+| cam1 → cam2           | 0.50°   | 13.3 mm   |
+| cam2 → cam3_left      | 0.82°   | 21.2 mm   |
+| cam3_left → cam4      | 1.63°   | 24.2 mm   |
+| cam4 → cam5           | 4.95°   | 19.9 mm   |
+| cam5 → cam3_right     | 2.15°   | 32.7 mm   |
+| cam3_right → cam1     | 4.58°   | 122.6 mm  |
+| cam3_left → cam3_right| 0.00°   | 0.0 mm    |
+
+The old `chain_transforms` C++ tool is still available but no longer the recommended path.
 
 ---
 
-## Step 6 — ZED Stereo Calibration (`calibrate_zed_stereo`)
+## Step 6 — ZED Stereo Calibration
 
-Calibrates the ZED left↔right stereo pair for baseline and rectification.
+ZED stereo baseline is now handled via the **factory calibration file** (`SN17307267.conf`)
+loaded directly in `optimize_poses.py`. No need to run `calibrate_zed_stereo`.
 
-```bash
-./build/calibrate_zed_stereo
-```
-
-The live preview shows both ZED half-images with:
-- Cyan boxes: ArUco marker boundaries (`drawDetectedMarkers`)
-- Green dots: ChArUco inner corners (`drawDetectedCornersCharuco`)
-
-Press `SPACE` to save a pair, `C` to run calibration on collected frames, `Q` to quit.
-
-**Status: UNRESOLVED.** Same wide-angle divergence issue as cam3 intrinsics.
-Output saved to `results/extrinsics/zed_left_right.yaml`.
+The `calibrate_zed_stereo` C++ tool exists but has unresolved issues (fisheye model crash,
+standard model divergence). Factory calibration is more reliable.
 
 ---
 
@@ -346,11 +374,23 @@ Open3D's `Visualizer` class.
 |-----------------|----------------|------------------------------------------|
 | `--cameras`     | cam1,cam2,cam4,cam5 | Comma-separated list of cameras     |
 | `--stride`      | 4              | Process every Nth pixel (higher = fewer points, faster) |
-| `--min_depth`   | 0.1 m          | Ignore depth below this                  |
+| `--min_depth`   | 0.25 m         | Ignore depth below this (L515 min=0.25m) |
 | `--max_depth`   | 4.0 m          | Ignore depth above this                  |
 | `--voxel`       | 0 (off)        | Voxel downsample size in metres          |
+| `--res`         | auto           | Stream resolution WxH (e.g. `640x480`)   |
+| `--fps`         | 15             | Stream framerate                         |
 | `--config`      | configs/cameras.yaml | Camera serial config                |
-| `--transforms`  | results/extrinsics/all_to_cam1.yaml | Chained transforms  |
+| `--transforms`  | results/extrinsics/all_to_cam1_extra.yaml | Optimized poses |
+| `--no_zed`      | off            | Skip ZED camera image plane              |
+| `--no_frustums` | off            | Skip camera frustum wireframes           |
+| `--t265`        | off            | Enable T265 tracking (axes + trajectory) |
+| `--zed_dev`     | from config    | Override ZED V4L2 device index           |
+| `--zed_scale`   | 0.5            | ZED texture resolution scale             |
+| `--plane_depth` | 1.5 m          | ZED image plane distance from camera     |
+| `--plane_scale` | 0.42           | ZED image plane size scale (1.0=full)    |
+
+**USB bandwidth tip:** When running all 4 cameras, use `--res 640x480 --fps 15` to reduce
+bandwidth. L515 cameras that don't support the requested resolution will fall back to auto.
 
 ### Per-camera colors
 
@@ -361,19 +401,29 @@ Open3D's `Visualizer` class.
 | cam4   | Yellow  |
 | cam5   | Magenta |
 
+### Features
+
+- **Point cloud fusion:** 4 RealSense cameras (cam1/cam2/cam4/cam5) fused into cam1 frame
+- **ZED image plane:** Textured quad showing ZED left camera RGB, projected at calibrated position
+  - Size/distance adjustable via `--plane_depth` and `--plane_scale`
+- **Camera frustums:** Cylinder-based wireframe frustums for all 6 camera positions (cam1, cam2, cam3L, cam3R, cam4, cam5), toggleable with `--no_frustums`
+- **T265 tracking:** Independent visualization showing moving coordinate axes at T265 pose + trajectory trace colored by confidence (green=high, red=low). Does NOT transform other geometry (T265-to-camera extrinsics not calibrated).
+
 ### Architecture
 
 ```
 main loop (Open3D PollEvents)
-  └── appendCam() × N active cameras
-        ├── wait_for_frames(200ms)
-        ├── align depth → color frame
-        ├── for each pixel at stride:
-        │     rs2_deproject_pixel_to_point  (color intrinsics)
-        │     apply T_1_N (4×4 matrix multiply)
-        │     append to pts / cols vectors
-        ├── UpdateGeometry(cloud)
-        └── ResetViewPoint(true)  [first frame only — fits view to data]
+  ├── T265 pose update (if --t265)
+  │     ├── update coordinate frame at current pose
+  │     └── append trajectory trace point (colored by confidence)
+  ├── appendCam() × N active RealSense cameras
+  │     ├── wait_for_frames(200ms)
+  │     ├── align depth → color frame
+  │     └── for each pixel at stride:
+  │           rs2_deproject_pixel_to_point → apply T_1_N → append
+  ├── UpdateGeometry(cloud)
+  ├── ZED V4L2 frame → update image plane texture
+  └── ResetViewPoint(true)  [first frame only — fits view to data]
 ```
 
 **Viewer controls (Open3D standard):**
@@ -434,20 +484,48 @@ relative paths (`configs/`, `data/`, `results/`) resolve correctly.
 
 ---
 
+## Issues Resolved
+
+1. **Transform inversion bug (CRITICAL):** `cv::stereoCalibrate` returns R,T mapping
+   camA→camB (T_b_from_a), but the pipeline expects T_a_b (from B into A). Both the C++
+   and Python calibration tools now invert the result before saving. This was the root cause
+   of the initial "big gap" in the fused point cloud.
+
+2. **D405 inverse_brown_conrady distortion:** D405 cameras use a distortion model
+   incompatible with OpenCV. Passing SDK coefficients directly caused 155px+ stereo RMS.
+   Fixed by re-calibrating D405 intrinsics with `cv2.calibrateCamera` using
+   `CALIB_USE_INTRINSIC_GUESS` with SDK K as initial guess (→ ~4px RMS, correct model).
+
+3. **ZED placeholder intrinsics:** cam3.yaml had estimated fx=674 with zero distortion.
+   Replaced with factory calibration from `SN17307267.conf` (fx=697.8 for left, fx=700.3
+   for right at 1280×720).
+
+4. **cam4_cam5 unreliable:** Original calibration had RMS=101px and T~2m (unrealistic).
+   Recaptured and recalibrated to RMS=14.5px with sensible translation.
+
+5. **Upper-lower camera misalignment:** The chain cam2→cam3→cam4 was the weak link between
+   upper cameras (cam1/cam2) and lower cameras (cam4/cam5). Improved by:
+   - Loop closure topology with pose graph optimization
+   - ZED factory stereo baseline as high-confidence constraint
+   - Multiple rounds of recapture for cam2-cam3 and cam3-cam4 pairs
+   - D405 intrinsic recalibration
+
+6. **USB bandwidth:** Added `--res` and `--fps` flags to `fuse_stream` with automatic
+   fallback for cameras that don't support the requested resolution.
+
 ## Pending Work
 
-1. **Fix ZED intrinsic calibration** — cam3.yaml is a placeholder (fx=674, zero distortion).
-   Options: two-phase calibration (fix focal, then release), or proper fisheye model
-   (`cv::fisheye::calibrate` with Nx1x3 CV_32FC3 object points).
+1. **cam3_right→cam1 loop closure residual** — 4.6° rotation / 123mm translation error.
+   Could be improved with recapture of this pair.
 
-2. **Recapture cam4_cam5 pair** — RMS=101px and T~2m are unrealistic.
-   Ensure the ChArUco board fills the frame from various angles and distances.
+2. **cam3 (ZED) depth in fuse_stream** — currently only cam1/cam2/cam4/cam5 are fused.
+   Would require ZED SDK or V4L2 depth access to include cam3.
 
-3. **Improve cam1_cam2 RMS** — currently 42px; with good data and correct intrinsics
-   this should be <5px. Recapture with more diverse board poses.
+3. **T265-to-camera extrinsic calibration** — T265 tracking is shown independently (axes +
+   trace) because the rigid transform between T265 and the camera array is unknown. Options:
+   - Physical measurement from 3D-printed rig CAD
+   - Hand-eye calibration (limited by T265 V-SLAM drift ~150mm)
+   - Currently NOT applied to scene geometry
 
-4. **ZED stereo calibration** — `calibrate_zed_stereo` needs the same intrinsic fix
-   before stereo baseline/rectification will be reliable.
-
-5. **Install ZED SDK** (optional) — would enable cam3 depth in `fuse_stream` and allow
+4. **Install ZED SDK** (optional) — would enable cam3 depth in `fuse_stream` and allow
    `fuse_and_view` to build.

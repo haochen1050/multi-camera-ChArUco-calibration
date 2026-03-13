@@ -3,6 +3,6 @@
 cameras:
   cam1: { model: "L515",  serial: "f0210390",    role: "reference" }
   cam2: { model: "L515",  serial: "f0171709" }
-  cam3: { model: "ZED",   serial: "N/A",  dev: 12 }
+  cam3: { model: "ZED",   serial: "N/A",  dev: 22 }
   cam4: { model: "D405",  serial: "130322271201" }
   cam5: { model: "D405",  serial: "218622270381" }
