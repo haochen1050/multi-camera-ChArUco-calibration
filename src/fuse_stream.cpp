@@ -748,24 +748,22 @@ int main(int argc, char** argv)
     if (zedMesh) vis.AddGeometry(zedMesh);
     if (zedFrustumMesh) vis.AddGeometry(zedFrustumMesh);
 
-    // 180° flip around X to orient scene right-side-up (T265 mounted upside down)
+    // 180° flip around X to orient scene right-side-up
     // This negates Y and Z for all geometry
     Eigen::Matrix3d sceneFlip = Eigen::Matrix3d::Identity();
-    if (rotateFrustums) {
-        sceneFlip(1,1) = -1; sceneFlip(2,2) = -1;
+    sceneFlip(1,1) = -1; sceneFlip(2,2) = -1;
 
-        // Flip frustum vertices
-        for (auto& f : frustums)
-            for (auto& v : f->vertices_) v = sceneFlip * v;
+    // Flip frustum vertices
+    for (auto& f : frustums)
+        for (auto& v : f->vertices_) v = sceneFlip * v;
 
-        // Flip ZED plane
-        if (zedMesh)
-            for (auto& v : zedMesh->vertices_) v = sceneFlip * v;
+    // Flip ZED plane
+    if (zedMesh)
+        for (auto& v : zedMesh->vertices_) v = sceneFlip * v;
 
-        // Flip ZED frustum
-        if (zedFrustumMesh)
-            for (auto& v : zedFrustumMesh->vertices_) v = sceneFlip * v;
-    }
+    // Flip ZED frustum
+    if (zedFrustumMesh)
+        for (auto& v : zedFrustumMesh->vertices_) v = sceneFlip * v;
 
     // Store flipped vertices as initial state for T265 rotation
     std::vector<std::vector<Eigen::Vector3d>> frustumInitVerts;
@@ -915,9 +913,10 @@ int main(int argc, char** argv)
             cloud->colors_ = down->colors_;
         }
 
-        // Flip + rotate point cloud to match plane/frustums
-        if (rotateFrustums) {
-            Eigen::Matrix3d R = t265_initial_set ? t265Rdelta * sceneFlip : sceneFlip;
+        // Flip scene right-side-up, and apply T265 rotation if enabled
+        {
+            Eigen::Matrix3d R = (rotateFrustums && t265_initial_set)
+                ? t265Rdelta * sceneFlip : sceneFlip;
             for (auto& p : cloud->points_)
                 p = R * p;
         }
